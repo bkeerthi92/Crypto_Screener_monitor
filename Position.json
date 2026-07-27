@@ -1,0 +1,10 @@
+{
+  "symbol": "DOGE",
+  "side": "LONG",
+  "entry_price": 0.0768,
+  "margin": 18.59,
+  "leverage": 5,
+  "target_price": 0.085,
+  "stop_loss": 0.072,
+  "style": "trend"
+}
