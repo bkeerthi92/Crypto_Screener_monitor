@@ -3063,6 +3063,112 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
+def run_ci_monitor(args, max_duration_seconds: float = 5.5 * 3600):
+    """
+    Runs the REAL continuous monitor loop non-interactively - built for a
+    single long-lived job (GitHub Actions or any scheduler that allows a
+    long-running process), NOT periodic short checks. Loops until
+    max_duration_seconds elapses (default 5.5h, safely under GitHub
+    Actions' 6h hard kill of any job), printing full per-cycle status to
+    stdout (visible live in the Actions log) and pushing a Telegram alert -
+    deduped across cycles so an unchanged condition doesn't spam - only on
+    a genuine exit condition (position mode) or a HIGH-confidence
+    actionable setup (watch mode, no position).
+    """
+    position = None
+    if args.position_file and _os.path.exists(args.position_file):
+        try:
+            with open(args.position_file) as f:
+                position = _json.load(f)
+        except Exception as e:
+            print(f"[ci-monitor] Could not read position file: {e}")
+
+    symbol = (args.symbol or (position or {}).get("symbol") or "").upper()
+    if not symbol:
+        print("[ci-monitor] No symbol given (pass one on the command line or in the position file). Exiting.")
+        return
+    symbol = COMMODITY_ALIASES.get(symbol, symbol)
+    apply_style(args.style or (position or {}).get("style") or "balanced")
+    pair = resolve_pair(symbol, args.quote)
+
+    poll_seconds = (args.poll_minutes or ACTIVE_STYLE.get("poll_minutes", 5)) * 60
+    ist = timezone(timedelta(hours=5, minutes=30))
+    start = time.time()
+    cycle = 0
+    last_alert_key = None
+
+    mode_desc = f"position: {position['side']} @ {position['entry_price']}" if position else "watch mode (no position)"
+    send_telegram_message(f"▶ Monitoring session started - {symbol} ({mode_desc}). "
+                           f"Checking every {poll_seconds // 60} min for up to "
+                           f"{max_duration_seconds / 3600:.1f}h this session.")
+    print(f"[ci-monitor] {symbol} ({pair}) - {mode_desc} - checking every {poll_seconds // 60} min "
+          f"for up to {max_duration_seconds / 3600:.1f}h")
+
+    while time.time() - start < max_duration_seconds:
+        cycle += 1
+        include_news = (not args.no_news) and (cycle % 6 == 1)
+        snap = run_analysis_cycle(symbol, pair, args, include_news=include_news)
+        ist_now = datetime.now(ist).strftime("%H:%M:%S IST")
+
+        if snap is None:
+            print(f"[{ist_now}] Cycle {cycle}: data fetch failed, will retry next interval.")
+            time.sleep(poll_seconds)
+            continue
+
+        combo = snap["combo"]
+        trade = suggest_trade_levels(snap["results"], {"verdict": combo["verdict"]})
+        conf = compute_trade_confidence(snap, trade)
+        print(f"\n[{ist_now}] Cycle {cycle}")
+        print(f"  Timeframes : {format_timeframe_verdicts(snap['results'])}")
+        print(f"  Strategy   : {format_strategy_verdicts(snap.get('strategy_signals'))}")
+        print(f"  Combined   : {combo['verdict']} (score {combo['blended_score']:+.2f})")
+        print(f"  Confidence : {conf['score']}/100 - {conf['tier']}")
+
+        alerts = []
+        if position:
+            basis = next((snap["results"][tf] for tf in TRADE_BASIS_FALLBACK_ORDER
+                          if tf in snap["results"]), None)
+            current_price = basis["price"] if basis else None
+            if current_price is not None:
+                metrics = compute_position_metrics(position, current_price)
+                soft_stop = None
+                if position.get("stop_loss") is None and basis and pd.notna(basis.get("atr")):
+                    soft_stop = (position["entry_price"] - 2 * basis["atr"]) if position["side"] == "LONG" \
+                        else (position["entry_price"] + 2 * basis["atr"])
+                alerts = check_exit_conditions(position, current_price, metrics, combo["verdict"],
+                                                soft_stop, liquidity=snap.get("liquidity"))
+                print(f"  Position   : {position['side']} @ {position['entry_price']} | "
+                      f"P&L {metrics['pnl']:+.2f} USDT ({metrics['pnl_pct_margin']:+.1f}% of margin)")
+        elif conf["score"] >= 70 and trade.get("available"):
+            alerts = [("TARGET", f"HIGH-confidence {trade['side']} setup - entry ~{trade['entry']:.6f}, "
+                                  f"stop {trade['stop_loss']:.6f}, T1 {trade['target1']:.6f}")]
+
+        if alerts:
+            for sev, msg in alerts:
+                print(f"  [{sev}] {msg}")
+            alert_key = ";".join(f"{sev}:{msg.split('(')[0].strip()}" for sev, msg in alerts)
+            if alert_key != last_alert_key:
+                lines = [f"🚨 {symbol} {position['side'] if position else ''}".strip()]
+                lines += [f"[{sev}] {msg}" for sev, msg in alerts]
+                lines.append(f"Verdict: {combo['verdict']} ({combo['blended_score']:+.2f}), "
+                             f"confidence {conf['score']}/100")
+                send_telegram_message("\n".join(lines))
+            else:
+                print("  (same alert as last cycle - not re-sending)")
+            last_alert_key = alert_key
+        else:
+            last_alert_key = None
+
+        remaining = max_duration_seconds - (time.time() - start)
+        if remaining <= poll_seconds:
+            break
+        time.sleep(poll_seconds)
+
+    send_telegram_message(f"⏹ Monitoring session for {symbol} ended (time limit reached). "
+                           f"Re-run the workflow to start another session.")
+    print(f"\n[ci-monitor] Session duration limit reached after {cycle} cycles. Exiting cleanly.")
+
+
 def run_headless_check(args):
     """
     NON-INTERACTIVE single check, built for schedulers (GitHub Actions cron,
@@ -3238,11 +3344,18 @@ def main():
     parser.add_argument("--position-file", default=None, help="JSON file with position details for headless mode")
     parser.add_argument("--state-file", default=None, help="JSON file persisting alert-dedupe state between headless runs")
     parser.add_argument("--heartbeat", action="store_true", help="Headless mode: send a Telegram summary even when there are no alerts")
+    parser.add_argument("--ci-monitor", action="store_true",
+                         help="Run the REAL continuous monitor loop for one long session (e.g. a single GitHub "
+                              "Actions job), capped safely under its 6h hard job-kill limit, instead of a single check")
+    parser.add_argument("--max-hours", type=float, default=5.5,
+                         help="Max session duration in hours for --ci-monitor (default 5.5, safely under GitHub's 6h limit)")
     args = parser.parse_args()
 
+    if args.ci_monitor:
+        run_ci_monitor(args, max_duration_seconds=args.max_hours * 3600)
+        return
+
     if args.headless_check:
-        if args.style:
-            pass  # applied inside run_headless_check
         run_headless_check(args)
         return
 
