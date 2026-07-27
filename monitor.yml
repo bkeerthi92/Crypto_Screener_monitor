@@ -1,28 +1,51 @@
-# GitHub Actions workflow for the CoinDCX signal bot.
-# SETUP: put this file at .github/workflows/monitor.yml in your repository.
+# GitHub Actions workflow: runs the REAL continuous monitor loop as ONE job,
+# not periodic short checks. Start it whenever you want to watch a position
+# or hunt for a setup; it keeps looping and printing live to this log for up
+# to 5.5 hours (safely under GitHub's hard 6-hour job kill), sending a
+# Telegram alert only on a real stop-loss/danger/target event or a
+# HIGH-confidence actionable setup (deduped so it won't spam repeats).
 #
-# HONEST LIMITS OF THIS APPROACH:
-# - Cron here is BEST-EFFORT: "*/15" often actually fires every 18-35 min,
-#   especially at busy times. Fine for trend monitoring; NOT for scalping.
-# - Scheduled workflows are auto-disabled after 60 days without a repo commit
-#   (the state-file commit below conveniently keeps it alive).
-# - Public repos run free; private repos consume your monthly Actions minutes
-#   (each run here uses roughly 1 minute).
+# SETUP: put this file at .github/workflows/monitor.yml in your repo.
+#
+# HOW TO START A SESSION:
+#   Repo -> Actions tab -> "Crypto Signal Monitor (long session)" -> Run workflow
+#   (optionally override the symbol / max hours in the inputs box)
+#
+# HONEST LIMITS:
+# - GitHub kills ANY job at 6h no matter what - this stops itself at 5.5h to
+#   exit cleanly first. Re-run the workflow for another session.
+# - This does NOT auto-restart itself. If you want it to always be running,
+#   add a `schedule:` trigger below that fires every 5.5h to chain sessions -
+#   commented out by default since you said you'd start it yourself.
+# - Public repos run free; private repos consume your monthly Actions minutes.
 
-name: Crypto Signal Monitor
+name: Crypto Signal Monitor (long session)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"   # every ~15 minutes (best-effort)
-  workflow_dispatch: {}       # also allows manual "Run workflow" button
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol to monitor (uses position.json's symbol if left blank)"
+        required: false
+        default: ""
+      max_hours:
+        description: "Max session length in hours (keep under 6)"
+        required: false
+        default: "5.5"
+  # Uncomment below to auto-start a new 5.5h session right after each one ends,
+  # for something closer to "always on" (still not a true infinite process -
+  # each run is a fresh session, state persists via position.json):
+  # schedule:
+  #   - cron: "0 */6 * * *"
 
 permissions:
-  contents: write             # needed to commit the dedupe state file back
+  contents: write
 
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355   # 5h55m - a safety margin above --max-hours 5.5 below
+
     steps:
       - uses: actions/checkout@v4
 
@@ -33,20 +56,16 @@ jobs:
       - name: Install dependencies
         run: pip install requests pandas numpy
 
-      - name: Run signal check
+      - name: Run continuous monitor session
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python crypto_signal_bot.py --headless-check \
+          SYMBOL_ARG=""
+          if [ -n "${{ github.event.inputs.symbol }}" ]; then
+            SYMBOL_ARG="${{ github.event.inputs.symbol }}"
+          fi
+          python crypto_signal_bot.py $SYMBOL_ARG --ci-monitor \
             --position-file position.json \
-            --state-file state.json \
+            --max-hours "${{ github.event.inputs.max_hours || '5.5' }}" \
             --no-news
-
-      - name: Persist alert-dedupe state
-        run: |
-          git config user.name "monitor-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add state.json || true
-          git diff --staged --quiet || git commit -m "monitor state [skip ci]"
-          git push || true
