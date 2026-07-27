@@ -1,0 +1,55 @@
+# GitHub Actions workflow: runs the REAL continuous monitor loop as ONE job,
+# not periodic short checks. Start it whenever you want to watch a position
+# or hunt for a setup; it keeps looping and printing live to this log for up
+# to 5.5 hours (safely under GitHub's hard 6-hour job kill), sending a
+# Telegram alert only on a real stop-loss/danger/target event or a
+# HIGH-confidence actionable setup (deduped so it won't spam repeats).
+#
+# HOW TO START A SESSION:
+#   Repo -> Actions tab -> "Crypto Signal Monitor (long session)" -> Run workflow
+
+name: Crypto Signal Monitor (long session)
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol to monitor (uses position.json's symbol if left blank)"
+        required: false
+        default: ""
+      max_hours:
+        description: "Max session length in hours (keep under 6)"
+        required: false
+        default: "5.5"
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run continuous monitor session
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          SYMBOL_ARG=""
+          if [ -n "${{ github.event.inputs.symbol }}" ]; then
+            SYMBOL_ARG="${{ github.event.inputs.symbol }}"
+          fi
+          python crypto_signal_bot.py $SYMBOL_ARG --ci-monitor \
+            --position-file position.json \
+            --max-hours "${{ github.event.inputs.max_hours || '5.5' }}" \
+            --no-news
