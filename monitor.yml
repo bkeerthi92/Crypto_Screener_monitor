@@ -1,0 +1,52 @@
+# GitHub Actions workflow for the CoinDCX signal bot.
+# SETUP: put this file at .github/workflows/monitor.yml in your repository.
+#
+# HONEST LIMITS OF THIS APPROACH:
+# - Cron here is BEST-EFFORT: "*/15" often actually fires every 18-35 min,
+#   especially at busy times. Fine for trend monitoring; NOT for scalping.
+# - Scheduled workflows are auto-disabled after 60 days without a repo commit
+#   (the state-file commit below conveniently keeps it alive).
+# - Public repos run free; private repos consume your monthly Actions minutes
+#   (each run here uses roughly 1 minute).
+
+name: Crypto Signal Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every ~15 minutes (best-effort)
+  workflow_dispatch: {}       # also allows manual "Run workflow" button
+
+permissions:
+  contents: write             # needed to commit the dedupe state file back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Run signal check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python crypto_signal_bot.py --headless-check \
+            --position-file position.json \
+            --state-file state.json \
+            --no-news
+
+      - name: Persist alert-dedupe state
+        run: |
+          git config user.name "monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json || true
+          git diff --staged --quiet || git commit -m "monitor state [skip ci]"
+          git push || true
